@@ -1,0 +1,8 @@
+.tmp_frames/
+.comfy/
+outputs/
+assets/run_*
+workflows/.run.json
+workflows/.run_api.json
+workflows/test_run.json
+__pycache__/

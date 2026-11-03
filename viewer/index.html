@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Splat Cinema Studio</title>
+<style>
+  :root { --bg:#0e0f12; --panel:#16181d; --line:#2a2d35; --fg:#e8e9ec; --dim:#8b909c; --accent:#ffb454; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.4 system-ui, sans-serif; display:grid; grid-template-columns: 320px 1fr; height:100vh; }
+  aside { background:var(--panel); border-right:1px solid var(--line); padding:16px; overflow:auto; }
+  h1 { font-size:16px; margin:0 0 12px; letter-spacing:.02em; }
+  h2 { font-size:11px; text-transform:uppercase; letter-spacing:.1em; color:var(--dim); margin:18px 0 6px; }
+  label { display:block; color:var(--dim); font-size:12px; margin-top:8px; }
+  label.check { display:flex; gap:6px; align-items:center; }
+  input[type=range], select, textarea, input[type=file] { width:100%; }
+  select, textarea { background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:6px; font:inherit; }
+  textarea { height:84px; resize:vertical; }
+  button { background:var(--accent); color:#1a1205; border:0; border-radius:6px; padding:9px 12px; font:inherit; font-weight:600; cursor:pointer; width:100%; margin-top:10px; }
+  button.secondary { background:transparent; color:var(--fg); border:1px solid var(--line); }
+  button:disabled { opacity:.5; cursor:default; }
+  .hint { color:var(--dim); font-size:12px; margin-top:6px; }
+  main { position:relative; display:grid; place-items:center; min-width:0; min-height:0; overflow:hidden; }
+  canvas#view { max-width:100%; max-height:100%; aspect-ratio:768 / 512; display:block; cursor:grab; }
+  #status { position:absolute; left:12px; bottom:12px; background:#000a; padding:6px 10px; border-radius:6px; font-size:12px; max-width:70%; }
+  video { width:100%; margin-top:10px; border-radius:6px; display:none; }
+</style>
+</head>
+<body>
+<aside>
+  <h1>Splat Cinema Studio</h1>
+
+  <h2>1 Scene</h2>
+  <input id="file" type="file" accept=".ply">
+  <button id="sample" class="secondary">Load procedural sample set</button>
+  <label>Point size <span id="pszv"></span></label>
+  <input id="psz" type="range" min="0.1" max="4" step="0.05" value="1">
+  <label class="check"><input id="flip" type="checkbox"> Flip upside down</label>
+  <div class="hint">Drag to orbit, wheel to zoom, right-drag to pan. Frame your opening shot, then pick a move.</div>
+
+  <h2>2 Camera move (starts from current view)</h2>
+  <select id="move">
+    <option value="orbit">Orbit</option>
+    <option value="push">Push-in</option>
+  </select>
+  <label>Amount <span id="amtv"></span></label>
+  <input id="amt" type="range" min="0" max="1" step="0.01" value="0.5">
+  <button id="preview" class="secondary">Preview move</button>
+
+  <h2>3 Depth range</h2>
+  <label>Far trim</label>
+  <input id="far" type="range" min="0.2" max="2" step="0.05" value="1">
+
+  <h2>4 Style</h2>
+  <select id="preset">
+    <option value="">Custom prompt</option>
+    <option>Painterly oil, warm golden light, soft grain</option>
+    <option>Neon cyberpunk night, wet reflections, volumetric haze</option>
+    <option>Hand-drawn anime background, flat colour, ink lines</option>
+  </select>
+  <textarea id="prompt">Painterly oil, warm golden light, soft grain</textarea>
+  <label>What is in the scan (keep it neutral, e.g. "a castle", so it does not fight the style)</label>
+  <textarea id="scene" style="height:56px">An aerial view of a castle with walls, towers and lawns</textarea>
+  <label>Keep original look <span id="keepv"></span> (lower = more style)</label>
+  <input id="keep" type="range" min="0" max="1" step="0.05" value="0.15">
+
+  <h2>5 Generate</h2>
+  <button id="render">Render depth and send to LTX</button>
+  <video id="out" controls loop></video>
+</aside>
+<main>
+  <canvas id="view"></canvas>
+  <div id="status">Load a .ply splat or point cloud to start.</div>
+</main>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import * as GS from 'https://cdn.jsdelivr.net/npm/@mkkellogg/gaussian-splats-3d@0.4.7/build/gaussian-splats-3d.module.js';
+
+const W = 768, H = 512, FRAMES = 97;           // matches the LTX workflow defaults
+const SERVER = location.port === '8787' ? '' : 'http://localhost:8787';
+const $ = id => document.getElementById(id);
+const status = t => { $('status').textContent = t; };
+
+const view = $('view');
+const renderer = new THREE.WebGLRenderer({ canvas: view, antialias: false, preserveDrawingBuffer: true });
+// internal resolution is fixed so exported guide frames always match the workflow (768x512)
+renderer.setPixelRatio(1); renderer.setSize(W, H, false);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x000000);
+const cam = new THREE.PerspectiveCamera(50, W / H, 0.01, 5000);
+const controls = new OrbitControls(cam, view);
+controls.enableDamping = true;
+
+let points = null, center = new THREE.Vector3(), radius = 1, base = null, preview = null, busy = false;
+
+// ---- materials: rgb and depth share geometry; per-point size comes from the splat's own scale ----
+const sizing = `attribute float psize; uniform float gain; uniform float scale;`;
+const pointSize = `gl_PointSize = clamp(psize * gain * scale / -mv.z, 1., 64.);`;
+const rgbMat = new THREE.ShaderMaterial({
+  uniforms: { gain: { value: 1 }, scale: { value: H } },
+  vertexShader: `${sizing} varying vec3 c; void main(){ c=color; vec4 mv=modelViewMatrix*vec4(position,1.); ${pointSize} gl_Position=projectionMatrix*mv; }`,
+  fragmentShader: `varying vec3 c; void main(){ vec2 q=gl_PointCoord-.5; if(dot(q,q)>.25) discard; gl_FragColor=vec4(c,1.); }`,
+  vertexColors: true,
+});
+const depthMat = new THREE.ShaderMaterial({
+  uniforms: { gain: { value: 1 }, scale: { value: H }, nearD: { value: 0.1 }, farD: { value: 10 } },
+  // depth discs are drawn larger than the splat with a 3px floor so the guide video has no holes
+  vertexShader: `${sizing} varying float d; void main(){ vec4 mv=modelViewMatrix*vec4(position,1.); d=-mv.z; gl_PointSize = clamp(psize * gain * scale / -mv.z, 3., 96.); gl_Position=projectionMatrix*mv; }`,
+  fragmentShader: `uniform float nearD, farD; varying float d; void main(){ vec2 q=gl_PointCoord-.5; if(dot(q,q)>.25) discard; float t=1.-clamp((log(d)-log(nearD))/(log(farD)-log(nearD)),0.,1.); gl_FragColor=vec4(vec3(t),1.); }`,
+});
+
+// ---- PLY loading: gaussian splat PLYs (f_dc_*, scale_*) and plain colored clouds, binary little endian ----
+function parsePLY(buf) {
+  const head = new TextDecoder().decode(new Uint8Array(buf, 0, Math.min(buf.byteLength, 8192)));
+  const end = head.indexOf('end_header');
+  const lines = head.slice(0, end).split('\n');
+  const n = +lines.find(l => l.startsWith('element vertex')).split(/\s+/)[2];
+  if (lines.some(l => l.includes('binary_big_endian') || l.includes('format ascii'))) throw new Error('Only binary_little_endian PLY is supported');
+  const props = lines.filter(l => l.startsWith('property')).map(l => l.trim().split(/\s+/));
+  const sizes = { float: 4, float32: 4, double: 8, uchar: 1, uint8: 1, char: 1, int: 4, uint: 4, short: 2, ushort: 2 };
+  let off = 0; const layout = {};
+  for (const [, type, name] of props) { layout[name] = { off, type }; off += sizes[type]; }
+  const stride = off;
+  const dv = new DataView(buf, head.slice(0, end).length + 'end_header\n'.length);
+  const rd = (i, p) => { const { off, type } = layout[p]; const o = i * stride + off;
+    return type === 'uchar' || type === 'uint8' ? dv.getUint8(o) : type.startsWith('double') ? dv.getFloat64(o, true) : dv.getFloat32(o, true); };
+  const splat = 'f_dc_0' in layout, rgb = 'red' in layout, scaled = 'scale_0' in layout, hasOp = 'opacity' in layout;
+  const C0 = 0.28209479177387814;
+  const pos = [], col = [], psz = [];
+  for (let i = 0; i < n; i++) {
+    if (hasOp && 1 / (1 + Math.exp(-rd(i, 'opacity'))) < 0.3) continue;       // drop near-transparent splats
+    pos.push(rd(i, 'x'), rd(i, 'y'), rd(i, 'z'));
+    if (splat) for (let k = 0; k < 3; k++) col.push(Math.min(1, Math.max(0, 0.5 + C0 * rd(i, 'f_dc_' + k))));
+    else if (rgb) for (let k = 0; k < 3; k++) col.push(rd(i, ['red', 'green', 'blue'][k]) / 255);
+    else col.push(0.8, 0.8, 0.8);
+    // gaussian scales are stored as logs; sprite diameter ~ 2.5 sigma of the mean axis
+    psz.push(scaled ? 2.5 * Math.exp((rd(i, 'scale_0') + rd(i, 'scale_1') + rd(i, 'scale_2')) / 3) : 0);
+  }
+  return { pos: Float32Array.from(pos), col: Float32Array.from(col), psz: Float32Array.from(psz) };
+}
+
+function robustBounds(pos) {            // 2nd to 98th percentile per axis, so stray floaters do not set the framing
+  const m = pos.length / 3, step = Math.max(1, Math.floor(m / 20000)), lo = [], hi = [];
+  for (let a = 0; a < 3; a++) { const v = []; for (let i = 0; i < m; i += step) v.push(pos[i * 3 + a]); v.sort((x, y) => x - y);
+    lo.push(v[Math.floor(v.length * 0.02)]); hi.push(v[Math.floor(v.length * 0.98)]); }
+  const c = new THREE.Vector3((lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2);
+  return { c, r: Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) / 2 };
+}
+
+function setCloud({ pos, col, psz }, label) {
+  if (points) { scene.remove(points); points.geometry.dispose(); }
+  const { c, r } = robustBounds(pos);
+  center.copy(c); radius = r;
+  const fallback = radius * 0.004;       // no per-point scale (lidar, plain PLY): constant world size
+  for (let i = 0; i < psz.length; i++) if (!(psz[i] > 0)) psz[i] = fallback;
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  g.setAttribute('psize', new THREE.BufferAttribute(psz, 1));
+  points = new THREE.Points(g, rgbMat);
+  points.frustumCulled = false;
+  points.rotation.x = $('flip').checked ? Math.PI : 0;
+  scene.add(points);
+  controls.target.copy(center);
+  cam.position.set(center.x, center.y + radius * 0.25, center.z + radius * 1.8);
+  cam.lookAt(center); controls.update();
+  status(`${label}: ${(pos.length / 3).toLocaleString()} points, radius ${radius.toFixed(2)}`);
+}
+
+// ---- camera moves: defined relative to the view the user framed. t in [0,1] -> pose ----
+function captureBase() { base = { p: cam.position.clone(), tg: controls.target.clone(), up: cam.up.clone() }; }
+function restoreBase() { cam.position.copy(base.p); controls.target.copy(base.tg); cam.lookAt(base.tg); controls.update(); }
+function placeCam(t) {
+  const amt = +$('amt').value, e = t * t * (3 - 2 * t);               // ease in/out
+  const off = base.p.clone().sub(base.tg);
+  if ($('move').value === 'orbit') off.applyAxisAngle(base.up, e * Math.PI * (0.25 + 0.75 * amt));   // up to 180 degrees
+  else off.multiplyScalar(1 - e * (0.15 + 0.45 * amt));                                           // push toward target, never inside the scan
+  cam.position.copy(base.tg).add(off); cam.lookAt(base.tg); cam.updateMatrixWorld();
+}
+
+// ---- depth range fit along the whole path ----
+function fitRange() {
+  const pos = points.geometry.attributes.position, step = Math.max(1, Math.floor(pos.count / 4000));
+  let lo = Infinity, hi = 0; const v = new THREE.Vector3();
+  for (let s = 0; s <= 8; s++) { placeCam(s / 8); points.updateMatrixWorld(); const mv = cam.matrixWorldInverse.clone().multiply(points.matrixWorld);
+    for (let i = 0; i < pos.count; i += step) { v.fromBufferAttribute(pos, i).applyMatrix4(mv); const d = -v.z;
+      if (d > 0.01) { lo = Math.min(lo, d); hi = Math.max(hi, d); } } }
+  return { near: Math.max(lo, 0.02), far: Math.max(hi * +$('far').value, lo * 2) };
+}
+
+// 'rgb' shows the real gaussian splat when one is loaded (else the points); 'depth' always uses the sized-point proxy
+let splat = null;
+function draw(mode) {
+  const useSplat = mode === 'rgb' && splat;
+  if (splat) splat.visible = !!useSplat;
+  points.visible = !useSplat;
+  points.material = mode === 'depth' ? depthMat : rgbMat;
+  renderer.render(scene, cam);
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function loadSplat(file) {
+  if (splat) { scene.remove(splat); await splat.dispose?.(); splat = null; }
+  const v = new GS.DropInViewer({ gpuAcceleratedSort: false, sharedMemoryForWorkers: false });
+  const url = URL.createObjectURL(file);
+  await v.addSplatScene(url, { format: GS.SceneFormat.Ply, showLoadingUI: false, splatAlphaRemovalThreshold: 5 });
+  URL.revokeObjectURL(url);
+  v.rotation.x = $('flip').checked ? Math.PI : 0;
+  scene.add(v); splat = v;
+}
+
+function loop() { requestAnimationFrame(loop); if (!points) return;
+  if (preview) { const t = (performance.now() - preview) / 4000;
+    if (t >= 1) { preview = null; restoreBase(); controls.enabled = true; } else placeCam(t); }
+  else if (!busy) controls.update();
+  draw('rgb'); }
+
+// ---- UI ----
+const label = () => { $('amtv').textContent = $('amt').value; $('pszv').textContent = $('psz').value; $('keepv').textContent = $('keep').value; };
+$('keep').oninput = () => label();
+$('file').onchange = async e => { const f = e.target.files[0]; if (!f) return; status('Parsing ' + f.name + ' (large files take a few seconds)...');
+  await sleep(30);
+  try {
+    const cloud = parsePLY(await f.arrayBuffer());
+    if (splat) { scene.remove(splat); splat = null; }
+    setCloud(cloud, f.name);
+    if (cloud.psz.some(s => s > 0) && /f_dc_0/.test(await f.slice(0, 8192).text())) {   // a real gaussian splat file
+      status('Loading splat renderer...'); await loadSplat(f);
+      status(`${f.name}: gaussian splat, ${(cloud.pos.length / 3).toLocaleString()} gaussians (depth pass uses sized points)`);
+    }
+  } catch (err) { status('Error: ' + err.message); } };
+$('sample').onclick = () => {
+  const n = 200000, pos = new Float32Array(n * 3), col = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) { const u = Math.random(), v = Math.random(), k = i % 4;
+    let x, y, z; if (k === 0) { x = (u - .5) * 8; y = -1; z = (v - .5) * 8; } else if (k === 1) { x = (u - .5) * 8; y = v * 3 - 1; z = -4; }
+    else if (k === 2) { x = -4; y = u * 3 - 1; z = (v - .5) * 8; } else { const a = u * 6.283, r = 0.3 + 0.15 * Math.sin(v * 20); x = Math.cos(a) * r + (((i >> 2) % 3) - 1) * 2; z = Math.sin(a) * r - 1; y = v * 2 - 1; }
+    pos.set([x, y, z], i * 3); col.set([0.4 + 0.5 * Math.abs(Math.sin(x)), 0.5 + 0.3 * Math.abs(Math.cos(z)), 0.6 + 0.3 * v], i * 3); }
+  setCloud({ pos, col, psz: new Float32Array(n) }, 'Procedural set'); };
+$('preview').onclick = () => { if (!points || preview) return; captureBase(); controls.enabled = false; preview = performance.now(); };
+$('psz').oninput = () => { rgbMat.uniforms.gain.value = +$('psz').value; depthMat.uniforms.gain.value = +$('psz').value * 2.2; label(); };
+depthMat.uniforms.gain.value = 2.2;
+$('flip').onchange = () => { const r = $('flip').checked ? Math.PI : 0; if (points) points.rotation.x = r; if (splat) splat.rotation.x = r; };
+['amt', 'move'].forEach(id => $(id).oninput = label);
+$('preset').onchange = e => { if (e.target.value) $('prompt').value = e.target.value; };
+// ---- settings survive closing the page (browser localStorage; the scene file itself is not stored) ----
+const SAVED = ['move', 'amt', 'psz', 'far', 'preset', 'prompt', 'scene', 'keep'], STORE = 'splat-cinema-studio.settings';
+try {
+  const s = JSON.parse(localStorage.getItem(STORE) || '{}');
+  for (const k of SAVED) if (k in s) $(k).value = s[k];
+  if ('flip' in s) $('flip').checked = s.flip;
+} catch {}
+const gain = () => { rgbMat.uniforms.gain.value = +$('psz').value; depthMat.uniforms.gain.value = +$('psz').value * 2.2; };
+gain();
+const save = () => { try { localStorage.setItem(STORE, JSON.stringify({ ...Object.fromEntries(SAVED.map(k => [k, $(k).value])), flip: $('flip').checked })); } catch {} };
+document.querySelector('aside').addEventListener('input', save);
+document.querySelector('aside').addEventListener('change', save);
+label(); loop();
+
+// ---- render guide passes, post to the local bridge, show the result ----
+$('render').onclick = async () => {
+  if (!points) return status('Load a scene first.');
+  busy = true; controls.enabled = false; preview = null; $('render').disabled = true; captureBase();
+  try {
+    const { near, far } = fitRange();
+    depthMat.uniforms.nearD.value = near; depthMat.uniforms.farD.value = far;
+    const post = (url, body, type) => fetch(SERVER + url, { method: 'POST', body, headers: type ? { 'Content-Type': type } : {} });
+    await post('/reset', '');
+    for (let i = 0; i < FRAMES; i++) {
+      placeCam(i / (FRAMES - 1));
+      draw('depth'); const depth = await new Promise(r => view.toBlob(r, 'image/png'));
+      await post('/frame/depth/' + i, depth, 'image/png');
+      if (i === 0) {                                  // first RGB frame: let the splat sort worker catch up to this pose
+        for (let k = 0; k < 4; k++) { draw('rgb'); await sleep(150); }
+        draw('rgb'); await post('/frame/first/0', await new Promise(r => view.toBlob(r, 'image/png')), 'image/png');
+      }
+      status(`Rendering guide pass ${i + 1}/${FRAMES}`);
+    }
+    status('Encoding and sending to Comfy + LTX (a few minutes)...');
+    const motion = $('move').value === 'orbit' ? 'a smooth slow orbit around the subject' : 'a slow steady push-in toward the subject';
+    const full = `${$('prompt').value.trim()}. ${$('scene').value.trim()}, fully rendered in this style, with a natural sky and soft distant background. The camera performs ${motion} in one continuous shot, no cuts, no scene changes, the same location throughout.`;
+    const res = await post('/generate', JSON.stringify({ prompt: full, keep_look: +$('keep').value }), 'application/json');
+    const j = await res.json(); if (!res.ok) throw new Error(j.error || 'generate failed');
+    const v = $('out'); v.src = SERVER + j.video + '?t=' + Date.now(); v.style.display = 'block'; v.play(); status('Done: ' + j.video);
+  } catch (e) { status('Error: ' + e.message); }
+  restoreBase(); busy = false; controls.enabled = true; $('render').disabled = false;
+};
+</script>
+</body>
+</html>
