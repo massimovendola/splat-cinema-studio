@@ -6,7 +6,11 @@ Built at the Comfy "Open Source Higgsfield" build night, on the Comfy Developer 
 
 ## Demo
 
-[demo/styles_side_by_side.mp4](demo/styles_side_by_side.mp4): the same castle scan and the same orbit, rendered three ways (candy, neon night, ink-outline anime). Geometry is identical across all three because it comes from the depth pass.
+![Depth guide (top left), then candy, neon night and ink-outline anime](demo/styles.gif)
+
+Top left is the depth guide pass rendered from the splat. The other three are LTX 2.3 outputs from that same depth clip and the same orbit, in different styles. Geometry is identical across all three because it comes from the depth pass.
+
+Full-resolution videos: [side by side](demo/styles_side_by_side.mp4) and [depth guide](demo/guide_depth.mp4).
 
 There is no hosted try-it link. The viewer and bridge run on your machine and generate on Comfy Cloud through your own account.
 
