@@ -4,6 +4,12 @@ An open-source take on cinema studio tools. Load a real gaussian splat or lidar 
 
 Built at the Comfy "Open Source Higgsfield" build night, on the Comfy Developer Platform (Comfy Cloud API via comfy-cli).
 
+## Demo
+
+[demo/styles_side_by_side.mp4](demo/styles_side_by_side.mp4): the same castle scan and the same orbit, rendered three ways (candy, neon night, ink-outline anime). Geometry is identical across all three because it comes from the depth pass.
+
+There is no hosted try-it link. The viewer and bridge run on your machine and generate on Comfy Cloud through your own account.
+
 ## How it works
 
 1. The viewer (three.js) loads a `.ply` splat or point cloud.
